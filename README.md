@@ -93,16 +93,21 @@ Isi `.env` kamu minimal seperti ini:
 ```
 RECALL_API_URL=https://api.sandbox.competitions.recall.network
 RECALL_API_KEY=pk_sandbox_xxxxxxxxxxxxxxxxx
+RECALL_COMPETITION_ID=d2d43ece-2bda-4e59-85b6-0440c2a43165  # lihat docs kompetisi untuk ID terbaru
 # Opsional untuk AI
 # OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxx
 # OPENAI_MODEL=gpt-4o-mini
 ```
+
+> Lihat [Recall paper trading docs](https://docs.recall.network/competitions/paper-trading) untuk daftar kompetisi
+> aktif (mis. jaringan BSC) dan salin `competitionId` yang sesuai ke variabel `RECALL_COMPETITION_ID`. Kalau lupa, server/CLI akan mencoba menarik ID kompetisi aktif otomatis dari endpoint `GET /api/competitions/status`, namun praktik terbaik tetap mengisinya eksplisit agar request trading tidak gagal.
 
 > Saat kompetisi live, ganti ke production:
 >
 > ```
 > RECALL_API_URL=https://api.competitions.recall.network
 > RECALL_API_KEY=pk_prod_xxxxxxxxxxxxxxxxx
+> RECALL_COMPETITION_ID=<competition-id-dari-dashboard>
 > ```
 
 ---

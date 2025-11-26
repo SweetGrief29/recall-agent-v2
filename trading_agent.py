@@ -1,4 +1,5 @@
 import os
+import time
 import argparse
 from typing import Dict, List, Optional
 
@@ -41,6 +42,16 @@ TOKEN_REGISTRY = {
     "BSC:WBNB": "0xBB4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
 }
 
+load_dotenv(override=True)
+API_KEY = os.getenv("RECALL_API_KEY")
+BASE = os.getenv("RECALL_API_URL", "https://api.sandbox.competitions.recall.network")
+COMPETITION_ID = os.getenv("RECALL_COMPETITION_ID")
+if not API_KEY:
+    raise SystemExit("RECALL_API_KEY belum ada di .env")
+
+_COMP_CACHE: Dict[str, float | str | None] = {"value": None, "ts": 0.0}
+_COMP_CACHE_TTL = 120.0
+
 # ===== Parameter strategi =====
 TARGET_WETH_PCT = 0.10  # target 10% dari total nilai portofolio
 MIN_TRADE_USD = 5.0  # jangan eksekusi < $5
@@ -53,21 +64,67 @@ def make_headers(key: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
-def get_balances(base: str, hdrs: Dict[str, str]) -> List[dict]:
+def _fetch_active_competition_id(base: str) -> Optional[str]:
+    now = time.time()
+    cached = _COMP_CACHE.get("value")
+    ts = float(_COMP_CACHE.get("ts", 0.0) or 0.0)
+    if cached and now - ts < _COMP_CACHE_TTL:
+        return str(cached)
+    try:
+        r = requests.get(f"{base}/api/competitions/status", headers=make_headers(API_KEY), timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        comp = data.get("competition") or {}
+        comp_id = comp.get("id")
+        if comp_id:
+            _COMP_CACHE["value"] = comp_id
+            _COMP_CACHE["ts"] = now
+            return comp_id
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_competition_id(value: Optional[str] = None) -> Optional[str]:
+    candidate = (value or "").strip() if isinstance(value, str) else value
+    if candidate:
+        return candidate
+    env_value = (COMPETITION_ID or "").strip() if COMPETITION_ID else ""
+    if env_value:
+        return env_value
+    return _fetch_active_competition_id(BASE)
+
+
+def _competition_params(params: Optional[Dict[str, str]], override: Optional[str] = None) -> Optional[Dict[str, str]]:
+    cid = _resolve_competition_id(override)
+    if not cid:
+        return params
+    merged = dict(params or {})
+    merged.setdefault("competitionId", cid)
+    return merged
+
+
+def _attach_competition(payload: Dict[str, str], override: Optional[str] = None) -> Dict[str, str]:
+    data = dict(payload or {})
+    cid = _resolve_competition_id(data.get("competitionId") or override)
+    if cid:
+        data["competitionId"] = cid
+    return data
+
+
+def get_balances(base: str, hdrs: Dict[str, str], competition_id: Optional[str] = None) -> List[dict]:
     url = f"{base}/api/agent/balances"
-    r = requests.get(url, headers=hdrs, timeout=20)
+    params = _competition_params({}, competition_id)
+    r = requests.get(url, params=params, headers=hdrs, timeout=20)
     r.raise_for_status()
     return r.json().get("balances", [])
 
 
-def get_price(base: str, hdrs: Dict[str, str], token: str, chain: str = "evm", specific: str = "eth") -> float:
+def get_price(base: str, hdrs: Dict[str, str], token: str, chain: str = "evm", specific: str = "eth", competition_id: Optional[str] = None) -> float:
     url = f"{base}/api/price"
-    r = requests.get(
-        url,
-        params={"token": token, "chain": chain, "specificChain": specific},
-        headers=hdrs,
-        timeout=20,
-    )
+    params = {"token": token, "chain": chain, "specificChain": specific}
+    params = _competition_params(params, competition_id)
+    r = requests.get(url, params=params, headers=hdrs, timeout=20)
     r.raise_for_status()
     return float(r.json().get("price", 0))
 
@@ -91,7 +148,7 @@ def resolve_token(token_or_symbol: str, specific: str = "eth") -> str:
 
 def execute_trade(base: str, hdrs: Dict[str, str], from_token: str, to_token: str,
                   amount_from_human: float, reason: Optional[str] = None,
-                  chain: str = "evm", specific: str = "eth") -> dict:
+                  chain: str = "evm", specific: str = "eth", competition_id: Optional[str] = None) -> dict:
     url = f"{base}/api/trade/execute"
     payload = {
         "fromToken": from_token,
@@ -104,6 +161,7 @@ def execute_trade(base: str, hdrs: Dict[str, str], from_token: str, to_token: st
         "toChain": chain,
         "toSpecificChain": specific,
     }
+    payload = _attach_competition(payload, competition_id)
     r = requests.post(url, json=payload, headers=hdrs, timeout=30)
     print("Trade response status:", r.status_code)
     print(r.text)
@@ -121,11 +179,12 @@ def run_rebalance(BASE: str, hdrs: Dict[str, str], target_pct: float = TARGET_WE
                   max_trade_usd: float = MAX_TRADE_USD, reserve_usd: float = USDC_RESERVE_USD,
                   min_trade_usd: float = MIN_TRADE_USD,
                   target_token: str = WETH_ETH, cash_token: str = USDC_ETH,
-                  chain: str = "evm", specific: str = "eth") -> None:
+                  chain: str = "evm", specific: str = "eth",
+                  competition_id: Optional[str] = None) -> None:
     target_token = resolve_token(target_token, specific)
     cash_token = resolve_token(cash_token, specific)
 
-    balances = get_balances(BASE, hdrs)
+    balances = get_balances(BASE, hdrs, competition_id)
     total_value = sum(float(b.get("value", 0.0)) for b in balances)
     target_val = 0.0
     target_amount = 0.0
@@ -151,7 +210,7 @@ def run_rebalance(BASE: str, hdrs: Dict[str, str], target_pct: float = TARGET_WE
 
     if target_price in (None, 0):
         try:
-            target_price = get_price(BASE, hdrs, target_token, chain=chain, specific=specific)
+            target_price = get_price(BASE, hdrs, target_token, chain=chain, specific=specific, competition_id=competition_id)
         except Exception:
             pass
 
@@ -177,7 +236,7 @@ def run_rebalance(BASE: str, hdrs: Dict[str, str], target_pct: float = TARGET_WE
         amount_from = trade_value_to_amount_usd(trade_usd, cash_price)
         print(f"BUY {amount_from:.6f} (from cash) ≈ ${trade_usd:,.2f}")
         execute_trade(BASE, hdrs, cash_token, target_token, amount_from,
-                      reason=f"rebalance buy to {int(target_pct*100)}%", chain=chain, specific=specific)
+                      reason=f"rebalance buy to {int(target_pct*100)}%", chain=chain, specific=specific, competition_id=competition_id)
     else:
         # Need to SELL target token
         if not target_price or target_price <= 0:
@@ -193,13 +252,14 @@ def run_rebalance(BASE: str, hdrs: Dict[str, str], target_pct: float = TARGET_WE
             return
         print(f"SELL {amount_target:.6f} (target) ≈ ${overweight_usd:,.2f}")
         execute_trade(BASE, hdrs, target_token, cash_token, amount_target,
-                      reason=f"rebalance sell from {int(target_pct*100)}%", chain=chain, specific=specific)
+                      reason=f"rebalance sell from {int(target_pct*100)}%", chain=chain, specific=specific, competition_id=competition_id)
 
 
 def run_manual(BASE: str, hdrs: Dict[str, str], side: str,
                from_token: str, to_token: str,
                amount_human: Optional[float], amount_usd: Optional[float],
-               reason: Optional[str], chain: str = "evm", specific: str = "eth") -> None:
+               reason: Optional[str], chain: str = "evm", specific: str = "eth",
+               competition_id: Optional[str] = None) -> None:
     if side not in {"buy", "sell"}:
         raise SystemExit("Side harus 'buy' atau 'sell'")
     from_token = resolve_token(from_token, specific)
@@ -208,10 +268,10 @@ def run_manual(BASE: str, hdrs: Dict[str, str], side: str,
         raise SystemExit("Wajib set --amount (human units) atau --amount-usd (>0)")
     if amount_human is None:
         # convert USD to human units using from-token price
-        px = get_price(BASE, hdrs, from_token, chain=chain, specific=specific)
+        px = get_price(BASE, hdrs, from_token, chain=chain, specific=specific, competition_id=competition_id)
         amount_human = trade_value_to_amount_usd(amount_usd, px)
     print(f"Manual {side.upper()}: {amount_human:.6f} from {from_token} → {to_token}")
-    execute_trade(BASE, hdrs, from_token, to_token, amount_human, reason=reason, chain=chain, specific=specific)
+    execute_trade(BASE, hdrs, from_token, to_token, amount_human, reason=reason, chain=chain, specific=specific, competition_id=competition_id)
 
 
 def run_batch_buy(
@@ -224,6 +284,7 @@ def run_batch_buy(
     chain: str = 'evm',
     specific: str = 'eth',
     reason: Optional[str] = None,
+    competition_id: Optional[str] = None,
 ) -> None:
     """Execute repeated buy trades until total_usd is spent."""
     if total_usd <= 0:
@@ -240,7 +301,7 @@ def run_batch_buy(
     while spent + 1e-9 < total_usd:
         remaining = total_usd - spent
         usd_chunk = min(chunk_usd, remaining)
-        price_from = get_price(BASE, hdrs, from_token_addr, chain=chain, specific=specific)
+        price_from = get_price(BASE, hdrs, from_token_addr, chain=chain, specific=specific, competition_id=competition_id)
         amount_from = trade_value_to_amount_usd(usd_chunk, price_from)
         iteration += 1
         print(f"Chunk {iteration}: buy ${usd_chunk:.2f} -> {amount_from:.6f} units")
@@ -254,6 +315,7 @@ def run_batch_buy(
             reason=f"{base_reason} #{iteration}",
             chain=chain,
             specific=specific,
+            competition_id=competition_id,
         )
         spent += usd_chunk
 
@@ -272,6 +334,7 @@ def run_batch_sell(
     reason: Optional[str] = None,
     total_token: Optional[float] = None,
     chunk_token: Optional[float] = None,
+    competition_id: Optional[str] = None,
 ) -> None:
     """Execute repeated sell trades until total_usd or total_token target is reached."""
     use_token_mode = total_token is not None and total_token > 0
@@ -305,7 +368,7 @@ def run_batch_sell(
             amount_from = token_chunk
             usd_chunk = None
             try:
-                price_from = get_price(BASE, hdrs, from_token_addr, chain=chain, specific=specific)
+                price_from = get_price(BASE, hdrs, from_token_addr, chain=chain, specific=specific, competition_id=competition_id)
             except Exception:
                 price_from = None
             if price_from:
@@ -318,7 +381,7 @@ def run_batch_sell(
             if remaining_usd <= 1e-9:
                 break
             usd_chunk = min(chunk_usd, remaining_usd)
-            price_from = get_price(BASE, hdrs, from_token_addr, chain=chain, specific=specific)
+            price_from = get_price(BASE, hdrs, from_token_addr, chain=chain, specific=specific, competition_id=competition_id)
             amount_from = trade_value_to_amount_usd(usd_chunk, price_from)
             print(f"Chunk {iteration + 1}: sell ${usd_chunk:.2f} -> {amount_from:.6f} units")
 
@@ -338,6 +401,7 @@ def run_batch_sell(
             reason=f"{base_reason} #{iteration}",
             chain=chain,
             specific=specific,
+            competition_id=competition_id,
         )
 
         sold_tokens = progress_tokens
@@ -356,12 +420,6 @@ def run_batch_sell(
 
 
 if __name__ == "__main__":
-    load_dotenv(override=True)
-    API_KEY = os.getenv("RECALL_API_KEY")
-    BASE = os.getenv("RECALL_API_URL", "https://api.sandbox.competitions.recall.network")
-    if not API_KEY:
-        raise SystemExit("RECALL_API_KEY belum ada di .env")
-
     parser = argparse.ArgumentParser(description="Trading Agent CLI (DEX multi-token)")
     parser.add_argument("mode", nargs="?", default="rebalance", choices=["rebalance", "manual", "batch-buy", "batch-sell"], help="Mode eksekusi")
     # rebalance params
@@ -385,12 +443,14 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-usd", type=float, default=1.0, help="Nominal USD per chunk batch trade (default 1)")
     parser.add_argument("--total-token", type=float, help="Total token (human units) untuk batch trade")
     parser.add_argument("--chunk-token", type=float, help="Jumlah token per chunk batch trade")
+    parser.add_argument("--competition-id", type=str, help="Override competitionId (default ambil dari .env)")
 
     args = parser.parse_args()
 
     hdrs = make_headers(API_KEY)
     print("BASE_URL =", BASE)
     print("API_KEY  =", API_KEY[:6] + "***")
+    comp_id = _resolve_competition_id(args.competition_id)
 
     if args.mode == "rebalance":
         target_pct = float(args.target_pct) / 100.0
@@ -400,7 +460,7 @@ if __name__ == "__main__":
             if not llm_mod:
                 raise SystemExit("Modul LLM tidak tersedia. Pastikan file llm.py dan library openai terpasang.")
             # Fetch balances first for LLM
-            balances = get_balances(BASE, hdrs)
+            balances = get_balances(BASE, hdrs, comp_id)
             try:
                 suggestion = llm_mod.suggest_rebalance_with_llm(
                     balances, default_target=target_token, default_cash=cash_token
@@ -423,6 +483,7 @@ if __name__ == "__main__":
             cash_token=cash_token,
             chain=args.chain,
             specific=args.specific_chain,
+            competition_id=comp_id,
         )
     elif args.mode == "manual":
         if args.side is None or args.from_token is None or args.to_token is None:
@@ -438,6 +499,7 @@ if __name__ == "__main__":
             reason=args.reason,
             chain=args.chain,
             specific=args.specific_chain,
+            competition_id=comp_id,
         )
     elif args.mode == "batch-buy":
         if args.to_token is None:
@@ -460,6 +522,7 @@ if __name__ == "__main__":
             chain=args.chain,
             specific=args.specific_chain,
             reason=reason,
+            competition_id=comp_id,
         )
     else:
         total_usd = args.total_usd if args.total_usd is not None else args.amount_usd
@@ -487,4 +550,5 @@ if __name__ == "__main__":
             reason=reason,
             total_token=total_token,
             chunk_token=chunk_token,
+            competition_id=comp_id,
         )

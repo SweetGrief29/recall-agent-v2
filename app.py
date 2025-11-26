@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import requests
 from dotenv import load_dotenv
@@ -13,16 +14,70 @@ from datetime import datetime, timezone
 # === Load env ===
 load_dotenv(override=True)
 API_KEY = os.getenv("RECALL_API_KEY")
-BASE    = os.getenv("RECALL_API_URL", "https://api.sandbox.competitions.recall.network")
+BASE    = os.getenv("RECALL_API_URL", "https://api.competitions.recall.network")
+COMPETITION_ID = os.getenv("RECALL_COMPETITION_ID")
 if not API_KEY:
     raise SystemExit("RECALL_API_KEY belum ada di .env")
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 WETH_ETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 
+_COMP_CACHE: dict[str, float | str | None] = {"value": None, "ts": 0.0}
+_COMP_CACHE_TTL = 120.0
+
 
 def hdrs():
     return {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+
+
+def _fetch_active_competition_id() -> str | None:
+    global _COMP_CACHE
+    now = time.time()
+    cached = _COMP_CACHE.get("value")
+    ts = float(_COMP_CACHE.get("ts", 0.0) or 0.0)
+    if cached and now - ts < _COMP_CACHE_TTL:
+        return str(cached)
+    try:
+        r = requests.get(f"{BASE}/api/competitions/status", headers=hdrs(), timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        comp = data.get("competition") or {}
+        comp_id = comp.get("id")
+        if comp_id:
+            _COMP_CACHE["value"] = comp_id
+            _COMP_CACHE["ts"] = now
+            return comp_id
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_competition_id(value: str | None = None) -> str | None:
+    candidate = (value or "").strip() if isinstance(value, str) else value
+    if candidate:
+        return candidate
+    env_value = (COMPETITION_ID or "").strip() if COMPETITION_ID else ""
+    if env_value:
+        return env_value
+    auto = _fetch_active_competition_id()
+    return auto or None
+
+
+def _competition_params(params: dict | None = None, override: str | None = None) -> dict | None:
+    cid = _resolve_competition_id(override)
+    if not cid:
+        return params
+    merged = dict(params or {})
+    merged.setdefault("competitionId", cid)
+    return merged
+
+
+def _attach_competition(payload: dict, override: str | None = None) -> dict:
+    data = dict(payload or {})
+    cid = _resolve_competition_id(data.get("competitionId") or override)
+    if cid:
+        data["competitionId"] = cid
+    return data
 
 
 def _default_specific_for_chain(chain: str | None):
@@ -38,18 +93,20 @@ def _default_specific_for_chain(chain: str | None):
     return None
 
 
-def _execute_trade_payload(payload: dict):
+def _execute_trade_payload(payload: dict, competition_override: str | None = None):
     upstream_text = None
     upstream_status = None
 
     def _execute(p: dict):
-        return requests.post(f"{BASE}/api/trade/execute", json=p, headers=hdrs(), timeout=30)
+        ready = _attach_competition(p, competition_override)
+        return requests.post(f"{BASE}/api/trade/execute", json=ready, headers=hdrs(), timeout=30)
 
-    r = _execute(payload)
+    base_payload = _attach_competition(payload, competition_override)
+    r = _execute(base_payload)
     upstream_text = r.text
     upstream_status = r.status_code
     if r.status_code in (400, 404) and (str(payload.get("fromChain")) == "svm" or str(payload.get("toChain")) == "svm"):
-        fallback = dict(payload)
+        fallback = dict(base_payload)
         changed = False
         if str(fallback.get("fromChain")) == "svm":
             fallback["fromChain"] = "solana"
@@ -75,10 +132,11 @@ def _execute_trade_payload(payload: dict):
 
 
 
-def _get_price(token: str, chain: str = "evm", specific_chain: str | None = "eth") -> float:
+def _get_price(token: str, chain: str = "evm", specific_chain: str | None = "eth", competition_id: str | None = None) -> float:
     params = {"token": token, "chain": chain}
     if specific_chain:
         params["specificChain"] = specific_chain
+    params = _competition_params(params, competition_id)
     r = requests.get(
         f"{BASE}/api/price",
         params=params,
@@ -126,11 +184,12 @@ def home(request: Request):
 
 # ---------- API Proxies ----------
 @app.get("/api/balances")
-def api_balances():
+def api_balances(competitionId: str | None = Query(None)):
     try:
         upstream_text = None
         upstream_status = None
-        r = requests.get(f"{BASE}/api/agent/balances", headers=hdrs(), timeout=20)
+        params = _competition_params({}, competitionId)
+        r = requests.get(f"{BASE}/api/agent/balances", params=params, headers=hdrs(), timeout=20)
         upstream_text = r.text
         upstream_status = r.status_code
         r.raise_for_status()
@@ -144,15 +203,13 @@ def api_balances():
 
 
 @app.get("/api/price")
-def api_price(token: str = Query(...), chain: str = "evm", specificChain: str = "eth"):
+def api_price(token: str = Query(...), chain: str = "evm", specificChain: str = "eth", competitionId: str | None = Query(None)):
     try:
         upstream_text = None
         upstream_status = None
-        r = requests.get(
-            f"{BASE}/api/price",
-            params={"token": token, "chain": chain, "specificChain": specificChain},
-            headers=hdrs(), timeout=20,
-        )
+        params = {"token": token, "chain": chain, "specificChain": specificChain}
+        params = _competition_params(params, competitionId)
+        r = requests.get(f"{BASE}/api/price", params=params, headers=hdrs(), timeout=20)
         upstream_text = r.text
         upstream_status = r.status_code
         r.raise_for_status()
@@ -170,7 +227,8 @@ def api_ai_suggest_rebalance():
     if not llm_mod:
         return JSONResponse({"error": "LLM module not available. Install 'openai' and ensure llm.py present."}, status_code=500)
     try:
-        rb = requests.get(f"{BASE}/api/agent/balances", headers=hdrs(), timeout=20).json()
+        params = _competition_params({})
+        rb = requests.get(f"{BASE}/api/agent/balances", params=params, headers=hdrs(), timeout=20).json()
         balances = rb.get("balances", [])
         data = llm_mod.suggest_rebalance_with_llm(balances, default_target=WETH_ETH, default_cash=USDC_ETH)
         return JSONResponse(data)
@@ -213,17 +271,18 @@ DEFAULT_TOKENS = [
     {"symbol": "DAI",  "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F", "chain": "evm", "specificChain": "eth"},
     {"symbol": "UNI",  "address": "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "chain": "evm", "specificChain": "eth"},
     # EVM: Polygon
-    {"symbol": "USDC", "address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "chain": "evm", "specificChain": "polygon"},
+    {"symbol": "USDC", "address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "chain": "evm", "specificChain": "polygon"},
     {"symbol": "WETH", "address": "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", "chain": "evm", "specificChain": "polygon"},
     {"symbol": "USDT", "address": "0xC2132D05D31c914a87C6611C10748AEB04B58e8F", "chain": "evm", "specificChain": "polygon"},
     {"symbol": "DAI",  "address": "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", "chain": "evm", "specificChain": "polygon"},
     # EVM: Base (partial known set)
     {"symbol": "WETH", "address": "0x4200000000000000000000000000000000000006", "chain": "evm", "specificChain": "base"},
+    {"symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "chain": "evm", "specificChain": "base"},
     {"symbol": "USDBC", "address": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", "chain": "evm", "specificChain": "base"},
     # EVM: Arbitrum
     {"symbol": "USDC", "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831", "chain": "evm", "specificChain": "arbitrum"},
     # EVM: Optimism
-    {"symbol": "USDC", "address": "0x7f5c764cbc14f9669b88837ca1490cca17c31607", "chain": "evm", "specificChain": "optimism"},
+    {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "chain": "evm", "specificChain": "optimism"},
 
     # Solana (SPL mints)
     {"symbol": "wSOL", "address": "So11111111111111111111111111111111111111112", "chain": "solana", "specificChain": "sol"},
@@ -586,6 +645,7 @@ def api_rebalance(body: dict = Body(...)):
     Rebalance target token ke target % memakai cash token.
     """
     try:
+        comp_id        = _resolve_competition_id(body.get("competitionId"))
         target_pct     = float(body.get("targetPct", 10.0))/100.0
         max_trade_usd  = float(body.get("maxTradeUsd", 500.0))
         reserve_usd    = float(body.get("usdcReserveUsd", body.get("reserveUsd", 50.0)))
@@ -601,7 +661,8 @@ def api_rebalance(body: dict = Body(...)):
             target_token = str(body.get("targetToken"))
             cash_token = str(body.get("cashToken"))
 
-        rb = requests.get(f"{BASE}/api/agent/balances", headers=hdrs(), timeout=20).json()
+        bal_params = _competition_params({}, comp_id)
+        rb = requests.get(f"{BASE}/api/agent/balances", params=bal_params, headers=hdrs(), timeout=20).json()
         b  = rb.get("balances", [])
         total = sum(x.get("value",0.0) for x in b)
         target_val = 0.0
@@ -634,7 +695,7 @@ def api_rebalance(body: dict = Body(...)):
             # Pastikan harga target tersedia untuk konversi unit
             if target_price in (None, 0):
                 try:
-                    target_price = _get_price(target_token, chain, specific_chain)
+                    target_price = _get_price(target_token, chain, specific_chain, competition_id=comp_id)
                 except Exception:
                     target_price = None
             if not target_price:
@@ -648,8 +709,7 @@ def api_rebalance(body: dict = Body(...)):
                 "fromChain": chain, "fromSpecificChain": specific_chain,
                 "toChain":   chain, "toSpecificChain":   specific_chain,
             }
-            r = requests.post(f"{BASE}/api/trade/execute", json=payload, headers=hdrs(), timeout=30)
-            r.raise_for_status()
+            resp, upstream_status, upstream_text = _execute_trade_payload(payload, comp_id)
             result = {
                 "action": "sell",
                 "targetPct": target_pct,
@@ -658,7 +718,7 @@ def api_rebalance(body: dict = Body(...)):
                 "amountFrom": amount_target,
                 "fromToken": target_token,
                 "toToken": cash_token,
-                "tx": r.json(),
+                "tx": resp,
             }
             try:
                 _append_trade({
@@ -669,7 +729,7 @@ def api_rebalance(body: dict = Body(...)):
                     "amountFrom": amount_target,
                     "tradeUsd": overweight_usd,
                     "payload": payload,
-                    "response": result.get("tx"),
+                    "response": resp,
                     "status": "ok",
                 })
                 # PnL: realized on sell
@@ -686,7 +746,7 @@ def api_rebalance(body: dict = Body(...)):
         # convert USD to from-token units via price
         if cash_price in (None, 0):
             try:
-                cash_price = _get_price(cash_token, chain, specific_chain)
+                cash_price = _get_price(cash_token, chain, specific_chain, competition_id=comp_id)
             except Exception:
                 pass
         amount_from = trade_usd / (cash_price or 1.0)
@@ -698,8 +758,7 @@ def api_rebalance(body: dict = Body(...)):
             "fromChain": chain, "fromSpecificChain": specific_chain,
             "toChain":   chain, "toSpecificChain":   specific_chain,
         }
-        r = requests.post(f"{BASE}/api/trade/execute", json=payload, headers=hdrs(), timeout=30)
-        r.raise_for_status()
+        resp, upstream_status, upstream_text = _execute_trade_payload(payload, comp_id)
         result = {
             "action": "buy",
             "targetPct": target_pct,
@@ -708,7 +767,7 @@ def api_rebalance(body: dict = Body(...)):
             "amountFrom": amount_from,
             "fromToken": cash_token,
             "toToken": target_token,
-            "tx": r.json(),
+            "tx": resp,
         }
         try:
             _append_trade({
@@ -718,12 +777,12 @@ def api_rebalance(body: dict = Body(...)):
                 "amountFrom": amount_from,
                 "tradeUsd": trade_usd,
                 "payload": payload,
-                "response": result.get("tx"),
+                "response": resp,
                 "status": "ok",
             })
             # PnL ledger (buy target token approx using price snapshot)
             try:
-                price_to = _get_price(target_token, chain, specific_chain)
+                price_to = _get_price(target_token, chain, specific_chain, competition_id=comp_id)
             except Exception:
                 price_to = None
             if price_to:
@@ -748,6 +807,7 @@ def api_rebalance(body: dict = Body(...)):
 @app.post("/api/batch-trade")
 def api_batch_trade(body: dict = Body(...)):
     try:
+        comp_id = _resolve_competition_id(body.get("competitionId"))
         side = str(body.get("side", "buy")).lower()
         if side not in {"buy", "sell"}:
             return JSONResponse({"error": "side harus buy atau sell"}, status_code=400)
@@ -813,7 +873,7 @@ def api_batch_trade(body: dict = Body(...)):
                 usd_chunk = None
                 price_from = None
                 try:
-                    price_from = _get_price(from_token, chain, specific_chain)
+                    price_from = _get_price(from_token, chain, specific_chain, competition_id=comp_id)
                 except Exception:
                     price_from = None
                 if price_from:
@@ -824,7 +884,7 @@ def api_batch_trade(body: dict = Body(...)):
                     break
                 usd_chunk = min(chunk_usd, remaining_usd)
                 try:
-                    price_from = _get_price(from_token, chain, specific_chain)
+                    price_from = _get_price(from_token, chain, specific_chain, competition_id=comp_id)
                 except Exception as exc:
                     return JSONResponse({"error": f"gagal ambil harga: {exc}"}, status_code=500)
                 if not price_from:
@@ -850,7 +910,7 @@ def api_batch_trade(body: dict = Body(...)):
             upstream_status = None
             upstream_text = None
             try:
-                resp, upstream_status, upstream_text = _execute_trade_payload(payload)
+                resp, upstream_status, upstream_text = _execute_trade_payload(payload, comp_id)
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 body_txt = getattr(getattr(exc, "response", None), "text", None)
@@ -917,7 +977,7 @@ def api_batch_trade(body: dict = Body(...)):
                     _ensure_token_known(from_token, None, chain, specific_chain or "")
                 if side == "buy":
                     try:
-                        price_to = _get_price(to_token, to_chain, to_specific_chain)
+                        price_to = _get_price(to_token, to_chain, to_specific_chain, competition_id=comp_id)
                     except Exception:
                         price_to = None
                     cost_usd = float(usd_chunk) if usd_chunk is not None else None
@@ -964,6 +1024,7 @@ def api_manual_trade(body: dict = Body(...)):
     }
     """
     try:
+        comp_id = _resolve_competition_id(body.get("competitionId"))
         side = body.get("side", "buy")
         reason = body.get("reason", "manual trade")
         chain = body.get("chain", "evm")
@@ -1013,7 +1074,7 @@ def api_manual_trade(body: dict = Body(...)):
             if amt <= 0:
                 return JSONResponse({"error": "amountUsd must be > 0 or provide amountToken"}, status_code=400)
             try:
-                px = _get_price(from_token, chain, specific_chain)
+                px = _get_price(from_token, chain, specific_chain, competition_id=comp_id)
             except Exception:
                 px = None
             amount_human = amt / px if px else amt
@@ -1082,11 +1143,11 @@ def api_manual_trade(body: dict = Body(...)):
             else:
                 _ensure_token_known(from_token, None, chain, specific_chain or "")
             try:
-                price_from = _get_price(from_token, chain, specific_chain)
+                price_from = _get_price(from_token, chain, specific_chain, competition_id=comp_id)
             except Exception:
                 price_from = None
             try:
-                price_to = _get_price(to_token, to_chain, to_specific_chain)
+                price_to = _get_price(to_token, to_chain, to_specific_chain, competition_id=comp_id)
             except Exception:
                 price_to = None
             if side == "buy":
@@ -1119,6 +1180,7 @@ def api_manual_trade(body: dict = Body(...)):
 @app.post("/api/bridge")
 def api_bridge(body: dict = Body(...)):
     try:
+        comp_id = _resolve_competition_id(body.get("competitionId"))
         from_chain = body.get("fromChain", "evm")
         from_specific = body.get("fromSpecificChain")
         if from_specific is not None:
@@ -1146,7 +1208,7 @@ def api_bridge(body: dict = Body(...)):
             amt = float(amount_usd or 0)
             if amt <= 0:
                 return JSONResponse({"error": "amountUsd harus > 0 atau sertakan amountHuman"}, status_code=400)
-            price_from = _get_price(from_token, from_chain, from_specific)
+            price_from = _get_price(from_token, from_chain, from_specific, competition_id=comp_id)
             if not price_from:
                 return JSONResponse({"error": "Harga fromToken tidak tersedia"}, status_code=500)
             amount_human = amt / float(price_from)
@@ -1169,7 +1231,7 @@ def api_bridge(body: dict = Body(...)):
         upstream_status = None
         upstream_text = None
         try:
-            resp, upstream_status, upstream_text = _execute_trade_payload(payload)
+            resp, upstream_status, upstream_text = _execute_trade_payload(payload, comp_id)
         except Exception as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             body_txt = getattr(getattr(exc, "response", None), "text", None)
@@ -1270,6 +1332,7 @@ def _autotrade_once():
     try:
         cfg = _auto_cfg_from_env()
         # Reuse logic like api_rebalance, but with min-delta and dry-run gate
+        comp_id        = _resolve_competition_id(cfg.get("competitionId"))
         target_pct     = float(cfg.get("targetPct", 10.0)) / 100.0
         max_trade_usd  = float(cfg.get("maxTradeUsd", 250.0))
         reserve_usd    = float(cfg.get("reserveUsd", 50.0))
@@ -1279,7 +1342,8 @@ def _autotrade_once():
         target_token   = str(cfg.get("targetToken", WETH_ETH))
         cash_token     = str(cfg.get("cashToken", USDC_ETH))
 
-        rb = requests.get(f"{BASE}/api/agent/balances", headers=hdrs(), timeout=20).json()
+        bal_params = _competition_params({}, comp_id)
+        rb = requests.get(f"{BASE}/api/agent/balances", params=bal_params, headers=hdrs(), timeout=20).json()
         b  = rb.get("balances", [])
         total = sum(x.get("value",0.0) for x in b)
         target_val = 0.0
@@ -1310,7 +1374,7 @@ def _autotrade_once():
 
         if cash_price in (None, 0):
             try:
-                cash_price = _get_price(cash_token, chain, specific_chain)
+                cash_price = _get_price(cash_token, chain, specific_chain, competition_id=comp_id)
             except Exception:
                 cash_price = 1.0
         amount_from = trade_usd / (cash_price or 1.0)
@@ -1329,9 +1393,7 @@ def _autotrade_once():
             _auto_state["lastAction"] = log
             return {"dryRun": True, **log}
 
-        r = requests.post(f"{BASE}/api/trade/execute", json=payload, headers=hdrs(), timeout=30)
-        r.raise_for_status()
-        resp = r.json()
+        resp, upstream_status, upstream_text = _execute_trade_payload(payload, comp_id)
         log = {"type": "auto", "mode": "live", "fromToken": cash_token, "toToken": target_token, "amountFrom": amount_from, "tradeUsd": trade_usd, "payload": payload, "response": resp, "status": "ok"}
         _append_trade(log)
         _auto_state["lastAction"] = log
